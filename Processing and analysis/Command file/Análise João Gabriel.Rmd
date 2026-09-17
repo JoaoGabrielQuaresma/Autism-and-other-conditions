@@ -1,0 +1,910 @@
+---
+title: "Análise João Gabriel"
+author: "João Gabriel Quaresma; Luis Anunciacao, PhD"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: paper
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+editor_options: 
+  chunk_output_type: inline
+---
+## Packages
+
+```{r}
+pacman::p_load(tidyverse, janitor, stringr, psych, corrr, ggcorrplot, gmodels, arsenal,rsvd, lavaan,semPlot, dplyr, nnet)
+```
+
+## Get data
+
+This code downloads all data from previous publication.
+
+```{r}
+tmp <- tempfile(fileext = ".RData")
+download.file("https://osf.io/download/87kqz", tmp, mode = "wb")
+load(tmp)
+rm(list = setdiff(ls(), c("df_team", "df_tead")))
+```
+
+## Items both tools
+
+```{r}
+items_tead5 <- c(
+  "tead_8", "tead_35", "tead_36", "tead_38", "tead_33",      # soc_com
+  "tead_9", "tead_3", "tead_5", "tead_28", "tead_29",        # soc_inter
+  "tead_70", "tead_69", "tead_4", "tead_73", "tead_66",      # sensorial
+  "tead_52", "tead_59", "tead_60", "tead_63", "tead_56"      # rep_beh
+)
+```
+
+```{r}
+items_team4 <- c(
+  "team_6", "team_11", "team_1", "team_9",      # cam
+  "team_5", "team_3", "team_4", "team_25",      # gender
+  "team_14", "team_22", "team_7", "team_21",    # cam2
+  "team_36", "team_37", "team_32", "team_35"    # sensory
+)
+```
+
+## Data TEAD
+
+```{r}
+set.seed(123)
+n_total <- 700
+
+# Eligible males and others
+males <- df_tead %>%
+  mutate(rowid = row_number()) %>%
+  filter(complete.cases(across(all_of(items_tead5))), genero == "Masculino", aq_total <= 8)
+
+others <- df_tead %>%
+  mutate(rowid = row_number()) %>%
+  filter(complete.cases(across(all_of(items_tead5))), genero != "Masculino", aq_total <= 8)
+
+n_male <- min(n_total %/% 2, nrow(males))
+n_other <- n_total - n_male
+
+#idx_tead is a vector of row indices (rowid) for the selected participants (your analytic sample)
+idx_tead  <- bind_rows(
+  males %>% slice_sample(n = n_male),
+  others %>% slice_sample(n = n_other)
+) %>%
+  sample_frac(1) %>%
+  pull(rowid)
+```
+
+## Data TEAM
+
+```{r}
+set.seed(123)
+idx_team <- df_team %>%
+  mutate(rowid = row_number()) %>%
+  filter(complete.cases(across(all_of(items_team4))), aq_total <= 6) %>%
+  slice_sample(n = 700) %>%
+  pull(rowid) 
+```
+
+## Compute clinical group TEAD
+
+```{r}
+df_tead <- df_tead %>%
+  mutate(
+    asd = grepl(
+      "sim|concordo fortemente|diagnosticad[oa]|recebi|avalia[cç][aã]o neuropsicol[oó]gica.*autismo|1997.*asperger|psiquiatra.*espectro",
+      voce_tem_diagnostico_de_transtorno_do_espectro_autista_tea,
+      ignore.case = TRUE
+    ),
+    
+    adhd = grepl(
+      "sim|concordo fortemente",
+      voce_tem_diagnostico_de_transtorno_de_deficit_de_atencao_e_hiperatividade_tdah,
+      ignore.case = TRUE
+    ),
+    
+    ocd = grepl(
+      "sim|concordo|concordo fortemente|neurologista me perguntou se eu sabia que eu tenho|recebi antes de receber o diagnostico de autismo|recebi, mas nao concordo com ele",
+      ja_recebi_diagnostico_de_transtorno_obsessivo_compulsivo_toc,
+      ignore.case = TRUE
+    )
+  ) %>%
+  mutate(
+    clinical_group = case_when(
+      asd  & !adhd & !ocd              ~ "asd",
+      asd  & adhd & !ocd              ~ "asd_adhd",
+      asd & ocd & !adhd               ~ "asd_ocd",
+      
+      adhd & !asd & !ocd               ~ "adhd",
+      adhd & ocd & !asd               ~ "adhd_ocd",
+      
+      ocd  & !asd & !adhd              ~ "ocd",
+      ocd  & adhd & asd              ~ "all_conditions",
+      
+      !asd & !adhd & !ocd              ~ "control",
+      
+      TRUE                             ~ NA_character_
+    )
+  )
+```
+
+## Demographic characteristics TEAD 
+
+## Table 1
+
+```{r}
+df_tead[idx_tead, ] %>% 
+  select(genero, clinical_group, idade) %>% 
+  arsenal::tableby(clinical_group ~ ., data = .) %>% 
+  summary(text = T, digits = 2) %>% 
+  as.data.frame()
+```
+
+## ANOVA & Post Hoc tests TEAD group (itens x conditions)
+
+```{r}
+df_tead[idx_tead, ] %>%
+  filter(!is.na(clinical_group)) %>%
+  select(clinical_group, all_of(items_tead5)) %>%
+  pivot_longer(
+    cols = all_of(items_tead5),
+    names_to = "item",
+    values_to = "score"
+  ) %>%
+  filter(!is.na(score)) %>%
+  group_by(item) %>%
+  summarise(
+    p_value = summary(aov(score ~ clinical_group))[[1]]$`Pr(>F)`[1],
+    .groups = "drop"
+  ) %>%
+  filter(p_value < 0.05) %>%
+  pull(item) %>%
+  map_dfr(function(it) {
+    dat <- df_tead[idx_tead, ] %>%
+      filter(!is.na(clinical_group)) %>%
+      select(clinical_group, score = all_of(it)) %>%
+      filter(!is.na(score))
+    TukeyHSD(aov(score ~ clinical_group, data = dat))$clinical_group %>%
+      as.data.frame() %>%
+      tibble::rownames_to_column("comparison") %>%
+      mutate(item = it) %>%
+      filter(`p adj` < 0.05)
+  }) %>%
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  arrange(item, comparison) %>%
+  select(item, comparison, diff, lwr, upr, `p adj`)
+```
+
+## Linear Regression TEAD group (age X condition)
+
+```{r}
+df_tead[idx_tead, ] %>%
+  filter(
+    !is.na(clinical_group),
+    !is.na(idade)
+  ) %>%
+  mutate(
+    clinical_group = relevel(factor(clinical_group), ref = "control"),
+    idade_num = readr::parse_number(as.character(idade))
+  ) %>%
+  filter(!is.na(idade)) %>%
+  lm(idade_num ~ clinical_group, data = .) %>%
+  broom::tidy() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+## Overview of symptoms group comparison TEAD
+
+```{r}
+df_tead[idx_tead, ] %>%
+  filter(!is.na(clinical_group)) %>%
+  mutate(
+    social_communication = rowSums(select(., tead_8, tead_35, tead_36, tead_38, tead_33), na.rm = TRUE),
+    social_interaction = rowSums(select(., tead_9, tead_3, tead_5, tead_28, tead_29), na.rm = TRUE),
+    sensorial = rowSums(select(., tead_70, tead_69, tead_4, tead_73, tead_66), na.rm = TRUE),
+    repetitive_behavior = rowSums(select(., tead_52, tead_59, tead_60, tead_63, tead_56), na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    cols = c(
+      social_communication,
+      social_interaction,
+      sensorial,
+      repetitive_behavior
+    ),
+    names_to = "social_emotional_skills",
+    values_to = "score"
+  ) %>%
+  group_by(social_emotional_skills) %>%
+  group_modify(~ {
+    
+    descriptives <- .x %>%
+      group_by(clinical_group) %>%
+      summarise(
+        result = paste0(
+          round(mean(score, na.rm = TRUE), 2),
+          " (",
+          round(sd(score, na.rm = TRUE), 2),
+          ")"
+        ),
+        .groups = "drop"
+      ) %>%
+      pivot_wider(
+        names_from = clinical_group,
+        values_from = result
+      )
+    
+    p_values <- pairwise.t.test(
+      x = .x$score,
+      g = .x$clinical_group,
+      p.adjust.method = "bonferroni"
+    )$p.value %>%
+      as.table() %>%
+      as.data.frame() %>%
+      filter(!is.na(Freq)) %>%
+      mutate(
+        comparison = paste0(Var1, " x ", Var2),
+        p_value = ifelse(
+          Freq < .001,
+          "< .001",
+          as.character(round(Freq, 3))
+        )
+      ) %>%
+      select(comparison, p_value) %>%
+      pivot_wider(
+        names_from = comparison,
+        values_from = p_value
+      )
+    
+    bind_cols(descriptives, p_values)
+    
+  }) %>%
+  ungroup() 
+```
+
+# Relative Risk Autism + ADHD and Autism + OCD TEAD
+
+```{r}
+purrr::map_dfr(
+  c("adhd", "ocd"),
+  \(cond) {
+
+    tab <- table(
+      ASD = df_tead[idx_tead, ]$asd,
+      Condition = df_tead[idx_tead, ][[cond]]
+    )
+
+    a <- tab["TRUE","TRUE"]
+    b <- tab["TRUE","FALSE"]
+    c <- tab["FALSE","TRUE"]
+    d <- tab["FALSE","FALSE"]
+
+    rr <- (a/(a+b)) / (c/(c+d))
+
+    se <- sqrt((1/a) - (1/(a+b)) + (1/c) - (1/(c+d)))
+
+    tibble::tibble(
+      condition = toupper(cond),
+
+      risk_asd = a/(a+b),
+      risk_non_asd = c/(c+d),
+
+      relative_risk = rr,
+
+      rr_ci_low = exp(log(rr) - 1.96*se),
+      rr_ci_high = exp(log(rr) + 1.96*se),
+
+      p_value = chisq.test(tab)$p.value
+    )
+
+  }
+) %>%
+  mutate(across(where(is.numeric), round, 3))
+```
+
+# Commorbities Autism TEAD
+
+```{r}
+df_tead[idx_tead, ] %>%
+  filter(asd) %>%
+  summarise(
+
+    n_autistas = n(),
+
+    ADHD = sum(adhd),
+    OCD = sum(ocd),
+
+    prop_ADHD = ADHD/n_autistas,
+    prop_OCD = OCD/n_autistas
+
+  ) %>%
+  mutate(
+
+    comorbidade_mais_frequente =
+      if_else(prop_ADHD > prop_OCD,
+              "ADHD",
+              "OCD"),
+
+    p_value =
+      df_tead[idx_tead, ] %>%
+      filter(asd) %>%
+      with(table(ADHD = adhd,
+                 OCD = ocd)) %>%
+      mcnemar.test() %>%
+      .$p.value
+
+  )
+```
+
+# Odds Ratio ADHD & OCD TEAD
+
+```{r}
+purrr::map_dfr(
+  c("adhd", "ocd"),
+  \(cond){
+
+    tab <- table(
+      ASD = df_tead[idx_tead, ]$asd,
+      Condition = df_tead[idx_tead, ][[cond]]
+    )
+
+    a <- tab["TRUE","TRUE"]
+    b <- tab["TRUE","FALSE"]
+    c <- tab["FALSE","TRUE"]
+    d <- tab["FALSE","FALSE"]
+
+    or <- (a*d)/(b*c)
+
+    se <- sqrt(1/a + 1/b + 1/c + 1/d)
+
+    tibble::tibble(
+
+      condition = toupper(cond),
+
+      odds_ratio = or,
+
+      or_ci_low = exp(log(or) - 1.96*se),
+
+      or_ci_high = exp(log(or) + 1.96*se),
+
+      p_value = chisq.test(tab)$p.value
+
+    )
+
+  }
+) %>%
+  mutate(across(where(is.numeric), round, 3))
+```
+
+## EFA TEAD
+
+```{r}
+efa_tead <- df_tead[idx_tead, items_tead5] 
+
+dim(efa_tead)
+sum(is.na(efa_tead))
+
+poly_tead <- psych::polychoric(efa_tead)
+R_tead <- poly_tead$rho
+
+bartlett_tead <- psych::cortest.bartlett(
+  R_tead,
+  n = nrow(efa_tead)
+)
+
+bartlett_tead
+
+kmo_tead <- psych::KMO(R_tead)
+
+kmo_tead
+kmo_tead$MSA
+sort(kmo_tead$MSAi)
+
+set.seed(123)
+
+psych::fa.parallel(
+  R_tead,
+  n.obs = nrow(efa_tead),
+  fa = "fa",
+  fm = "minres"
+)
+```
+
+# Dimensional Comparison TEAD X AQ-10
+
+```{r}
+fit_esem_aq_tead <- df_tead[idx_tead, ] %>%
+  select(
+    aq_1:aq_10,
+    all_of(items_tead5)
+  ) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  lavaan::sem(
+    model = '
+      efa("efa1")*F1 +
+      efa("efa1")*F2 +
+      efa("efa1")*F3 +
+      efa("efa1")*F4 =~
+        aq_1 + aq_2 + aq_3 + aq_4 + aq_5 +
+        aq_6 + aq_7 + aq_8 + aq_9 + aq_10 +
+        tead_8 + tead_35 + tead_36 + tead_38 + tead_33 +
+        tead_9 + tead_3 + tead_5 + tead_28 + tead_29 +
+        tead_70 + tead_69 + tead_4 + tead_73 + tead_66 +
+        tead_52 + tead_59 + tead_60 + tead_63 + tead_56
+    ',
+    estimator = "WLSMV",
+    ordered = c(
+      paste0("aq_", 1:10),
+      items_tead5
+    ),
+    rotation = "geomin"
+  )
+
+fit_esem_aq_tead %>%
+  lavaan::fitMeasures(
+    c(
+      "cfi",
+      "rmsea",
+      "cfi.robust",
+      "rmsea.robust"
+    )
+  )
+
+fit_esem_aq_tead %>%
+  lavaan::standardizedSolution() %>%
+  filter(op == "=~") %>%
+  select(
+    factor = lhs,
+    item = rhs,
+    loading = est.std
+  ) %>%
+  arrange(factor, desc(abs(loading)))
+```
+
+## Compute clinical group TEAM
+
+```{r}
+df_team <- df_team %>% 
+  mutate(
+    asd = grepl(
+      "sim|a medica|altas|estou.*autismo|nao confiei|so em 1997",
+      voce_tem_diagnostico_de_transtorno_do_espectro_autista_tea,
+      ignore.case = TRUE
+    ),
+    
+    adhd = grepl(
+      "sim|concordo|5|h[aá] 2 anos",
+      ja_recebi_diagnostico_de_transtorno_de_deficit_de_atencao_e_hiperatividade_tdah,
+      ignore.case = TRUE
+    ),
+    
+    ocd = grepl(
+      "sim|concordo|5|j[aá] recebi mas n[aã]o acredito",
+      ja_recebi_diagnostico_de_transtorno_obsessivo_compulsivo_toc,
+      ignore.case = TRUE
+    ),
+    
+    exclude = grepl(
+      "sim e nao\\. na infancia fui \"diagnosticada\" mas atualmente nao sei",
+      ja_recebi_diagnostico_de_transtorno_de_deficit_de_atencao_e_hiperatividade_tdah,
+      ignore.case = TRUE
+    ) |
+      grepl(
+        "sim, mas a maioria das caracteristicas foi confundida pelos profissionais, eram esteriotipias",
+        ja_recebi_diagnostico_de_transtorno_obsessivo_compulsivo_toc,
+        ignore.case = TRUE
+      )
+  ) %>% 
+  mutate(
+    clinical_group = case_when(
+      exclude ~ NA_character_,
+      
+      asd & !adhd & !ocd ~ "asd",
+      asd & adhd & !ocd ~ "asd_adhd",
+      asd & ocd & !adhd ~ "asd_ocd",
+      asd & adhd & ocd ~ "all_conditions",
+      
+      adhd & !asd & !ocd ~ "adhd",
+      adhd & ocd & !asd ~ "adhd_ocd",
+      
+      ocd & !asd & !adhd ~ "ocd",
+      
+      !asd & !adhd & !ocd ~ "control",
+      
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+## ANOVA & Post Hoc tests TEAM group (itens x conditions)
+
+```{r}
+df_team[idx_team, ] %>%
+  filter(!is.na(clinical_group)) %>%
+  select(clinical_group, all_of(items_team4)) %>%
+  pivot_longer(
+    cols = all_of(items_team4),
+    names_to = "item",
+    values_to = "score"
+  ) %>%
+  filter(!is.na(score)) %>%
+  group_by(item) %>%
+  summarise(
+    p_value = summary(aov(score ~ clinical_group))[[1]]$`Pr(>F)`[1],
+    .groups = "drop"
+  ) %>%
+  filter(p_value < 0.05) %>%
+  pull(item) %>%
+  map_dfr(function(it) {
+    dat <- df_team[idx_team, ] %>%
+      filter(!is.na(clinical_group)) %>%
+      select(clinical_group, score = all_of(it)) %>%
+      filter(!is.na(score))
+    TukeyHSD(aov(score ~ clinical_group, data = dat))$clinical_group %>%
+      as.data.frame() %>%
+      tibble::rownames_to_column("comparison") %>%
+      mutate(item = it) %>%
+      filter(`p adj` < 0.05)
+  }) %>%
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  arrange(item, comparison) %>%
+  select(item, comparison, diff, lwr, upr, `p adj`)
+```
+
+## Demographic characteristics TEAM 
+
+## Table 1
+
+```{r}
+df_team[idx_team, ] %>% 
+  select(genero, clinical_group, idade) %>% 
+  arsenal::tableby(clinical_group ~ ., data = .) %>% 
+  summary(text = T, digits = 2) %>% 
+  as.data.frame()
+```
+## Linear Regression TEAM group (age X condition)
+
+```{r}
+df_team[idx_team, ] %>%
+  filter(
+    !is.na(clinical_group),
+    !is.na(qual_e_a_sua_idade_em_numeros)
+  ) %>%
+  mutate(
+    clinical_group = relevel(factor(clinical_group), ref = "control"),
+    idade_num = readr::parse_number(as.character(qual_e_a_sua_idade_em_numeros))
+  ) %>%
+  filter(!is.na(idade_num)) %>%
+  lm(idade_num ~ clinical_group, data = .) %>%
+  broom::tidy() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+## ANOVA & Post Hoc tests TEAM group (itens x conditions + age)
+
+```{r}
+df_team[idx_team, ] %>%
+  filter(
+    !is.na(clinical_group),
+    !is.na(qual_e_a_sua_idade_em_numeros)
+  ) %>%
+  mutate(
+    idade_num = readr::parse_number(as.character(qual_e_a_sua_idade_em_numeros)),
+    clinical_group = as.factor(clinical_group)
+  ) %>%
+  select(clinical_group, idade_num, all_of(items_team4)) %>%
+  pivot_longer(
+    cols = all_of(items_team4),
+    names_to = "item",
+    values_to = "score"
+  ) %>%
+  filter(
+    !is.na(score),
+    !is.na(idade_num)
+  ) %>%
+  group_by(item) %>%
+  group_modify(~ {
+    
+    modelo <- lm(score ~ clinical_group + idade_num, data = .x)
+    
+    anova_model <- anova(modelo)
+    
+    p_group <- anova_model["clinical_group", "Pr(>F)"]
+    
+    if (!is.na(p_group) && p_group < 0.05) {
+      
+      pairwise.t.test(
+        x = .x$score,
+        g = .x$clinical_group,
+        p.adjust.method = "bonferroni"
+      ) %>%
+        broom::tidy() %>%
+        filter(p.value < 0.05)
+      
+    } else {
+      tibble()
+    }
+    
+  }) %>%
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  arrange(item)
+```
+
+## Descriptive statistics and overview of group comparison TEAM
+
+```{r}
+df_team[idx_team, ] %>%
+  filter(!is.na(clinical_group)) %>%
+  mutate(
+    camouflage_ca = rowSums(select(., team_6, team_11, team_1, team_9), na.rm = TRUE),
+    gender_self_id = rowSums(select(., team_5, team_3, team_4, team_25), na.rm = TRUE),
+    camouflage_m = rowSums(select(., team_14, team_22, team_7, team_21), na.rm = TRUE),
+    sensory_sensitivity = rowSums(select(., team_36, team_37, team_32, team_35), na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    cols = c(
+      camouflage_ca,
+      gender_self_id,
+      camouflage_m,
+      sensory_sensitivity
+    ),
+    names_to = "social_emotional_skills",
+    values_to = "score"
+  ) %>%
+  group_by(social_emotional_skills) %>%
+  group_modify(~ {
+    
+    descriptives <- .x %>%
+      group_by(clinical_group) %>%
+      summarise(
+        result = paste0(
+          round(mean(score, na.rm = TRUE), 2),
+          " (",
+          round(sd(score, na.rm = TRUE), 2),
+          ")"
+        ),
+        .groups = "drop"
+      ) %>%
+      pivot_wider(
+        names_from = clinical_group,
+        values_from = result
+      )
+    
+    p_values <- pairwise.t.test(
+      x = .x$score,
+      g = .x$clinical_group,
+      p.adjust.method = "bonferroni"
+    )$p.value %>%
+      as.table() %>%
+      as.data.frame() %>%
+      filter(!is.na(Freq)) %>%
+      mutate(
+        comparison = paste0(Var1, " x ", Var2),
+        p_value = ifelse(
+          Freq < .001,
+          "< .001",
+          as.character(round(Freq, 3))
+        )
+      ) %>%
+      select(comparison, p_value) %>%
+      pivot_wider(
+        names_from = comparison,
+        values_from = p_value
+      )
+    
+    bind_cols(descriptives, p_values)
+    
+  }) %>%
+  ungroup() %>%
+  select(
+    social_emotional_skills,
+    adhd,
+    asd,
+    control,
+    ocd,
+    everything()
+  ) %>%
+  arrange(social_emotional_skills)
+```
+
+# Relative Risk Autism + ADHD and Autism + OCD TEAM
+
+```{r}
+purrr::map_dfr(
+  c("adhd", "ocd"),
+  \(cond) {
+
+    tab <- table(
+      ASD = df_team[idx_team, ]$asd,
+      Condition = df_team[idx_team, ][[cond]]
+    )
+
+    a <- tab["TRUE","TRUE"]
+    b <- tab["TRUE","FALSE"]
+    c <- tab["FALSE","TRUE"]
+    d <- tab["FALSE","FALSE"]
+
+    rr <- (a/(a+b)) / (c/(c+d))
+
+    se <- sqrt((1/a) - (1/(a+b)) + (1/c) - (1/(c+d)))
+
+    tibble::tibble(
+      condition = toupper(cond),
+
+      risk_asd = a/(a+b),
+      risk_non_asd = c/(c+d),
+
+      relative_risk = rr,
+
+      rr_ci_low = exp(log(rr) - 1.96*se),
+      rr_ci_high = exp(log(rr) + 1.96*se),
+
+      p_value = chisq.test(tab)$p.value
+    )
+
+  }
+) %>%
+  mutate(across(where(is.numeric), round, 3))
+```
+
+# Commorbities Autism TEAD
+
+```{r}
+df_team[idx_team, ] %>%
+  filter(asd) %>%
+  summarise(
+
+    n_autistas = n(),
+
+    ADHD = sum(adhd),
+    OCD = sum(ocd),
+
+    prop_ADHD = ADHD/n_autistas,
+    prop_OCD = OCD/n_autistas
+
+  ) %>%
+  mutate(
+
+    comorbidade_mais_frequente =
+      if_else(prop_ADHD > prop_OCD,
+              "ADHD",
+              "OCD"),
+
+    p_value =
+      df_team[idx_team, ] %>%
+      filter(asd) %>%
+      with(table(ADHD = adhd,
+                 OCD = ocd)) %>%
+      mcnemar.test() %>%
+      .$p.value
+
+  )
+```
+
+# Odds Ratio ADHD & OCD TEAD
+
+```{r}
+purrr::map_dfr(
+  c("adhd", "ocd"),
+  \(cond){
+
+    tab <- table(
+      ASD = df_team[idx_team, ]$asd,
+      Condition = df_team[idx_team, ][[cond]]
+    )
+
+    a <- tab["TRUE","TRUE"]
+    b <- tab["TRUE","FALSE"]
+    c <- tab["FALSE","TRUE"]
+    d <- tab["FALSE","FALSE"]
+
+    or <- (a*d)/(b*c)
+
+    se <- sqrt(1/a + 1/b + 1/c + 1/d)
+
+    tibble::tibble(
+
+      condition = toupper(cond),
+
+      odds_ratio = or,
+
+      or_ci_low = exp(log(or) - 1.96*se),
+
+      or_ci_high = exp(log(or) + 1.96*se),
+
+      p_value = chisq.test(tab)$p.value
+
+    )
+
+  }
+) %>%
+  mutate(across(where(is.numeric), round, 3))
+```
+
+## EFA TEAM
+
+```{r}
+efa_team <- df_team[idx_team, items_team4]
+
+dim(efa_team)
+sum(is.na(efa_team))
+
+poly_team <- psych::polychoric(efa_team)
+R_team <- poly_team$rho
+
+bartlett_team <- psych::cortest.bartlett(
+  R_team,
+  n = nrow(efa_team)
+)
+
+bartlett_team
+
+kmo_team <- psych::KMO(R_team)
+
+kmo_team
+kmo_team$MSA
+sort(kmo_team$MSAi)
+
+set.seed(123)
+
+psych::fa.parallel(
+  R_team,
+  n.obs = nrow(efa_team),
+  fa = "fa",
+  fm = "minres"
+)
+```
+
+# Dimensional Comparison TEAM X AQ-10
+
+```{r}
+fit_esem_aq_team <- df_team[idx_team, ] %>%
+  select(
+    aq_1:aq_10,
+    all_of(items_team4)
+  ) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  lavaan::sem(
+    model = '
+      efa("efa1")*F1 +
+      efa("efa1")*F2 +
+      efa("efa1")*F3 +
+      efa("efa1")*F4 =~
+        aq_1 + aq_2 + aq_3 + aq_4 + aq_5 +
+        aq_6 + aq_7 + aq_8 + aq_9 + aq_10 +
+        team_6 + team_11 + team_1 + team_9 +
+        team_5 + team_3 + team_4 + team_25 +
+        team_14 + team_22 + team_7 + team_21 +
+        team_36 + team_37 + team_32 + team_35
+    ',
+    estimator = "WLSMV",
+    ordered = c(
+      paste0("aq_", 1:10),
+      items_team4
+    ),
+    rotation = "geomin"
+  )
+
+fit_esem_aq_team %>%
+  lavaan::fitMeasures(
+    c(
+      "cfi",
+      "rmsea",
+      "cfi.robust",
+      "rmsea.robust"
+    )
+  )
+
+fit_esem_aq_team %>%
+  lavaan::standardizedSolution() %>%
+  filter(op == "=~") %>%
+  select(
+    factor = lhs,
+    item = rhs,
+    loading = est.std
+  ) %>%
+  arrange(factor, desc(abs(loading)))
+```
